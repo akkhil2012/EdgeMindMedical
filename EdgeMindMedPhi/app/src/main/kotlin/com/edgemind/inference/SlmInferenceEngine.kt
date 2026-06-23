@@ -49,9 +49,20 @@ class SlmInferenceEngine(
         maxNewTokens: Int,
         startMs: Long
     ): InferenceResult {
-        val inputIds = tokenizer.encode(buildPrompt(prompt, taskType))
+        // Tokenize the prompt. `rawIds` is the variable-length, "real" token sequence.
+        val rawIds = tokenizer.encode(buildPrompt(prompt, taskType))
+
+        // The .pte was exported with `padding="max_length", max_length=SEQ_LEN`, so the
+        // graph expects a fixed [SEQ_LEN] input. Right-pad with PAD_TOKEN_ID (truncate if over).
+        val inputIds = padOrTruncate(rawIds, SEQ_LEN, PAD_TOKEN_ID.toLong())
+
+        // Keep the *real* (pre-pad) length, capped at SEQ_LEN, for decoding. Passing the
+        // padded length (SEQ_LEN) into greedyDecode would make it read logits from the
+        // padding region instead of right after the last real token.
+        val realLen = rawIds.size.coerceAtMost(SEQ_LEN)
+
         val logits = runner.forward(inputIds)
-        val generatedIds = greedyDecode(logits, inputIds.size, maxNewTokens)
+        val generatedIds = greedyDecode(logits, realLen, maxNewTokens)
         val text = tokenizer.decode(generatedIds)
         val confidence = extractConfidence(logits, taskType)
         return InferenceResult(
@@ -161,6 +172,23 @@ class SlmInferenceEngine(
         return "<|system|>$systemPrompt<|end|><|user|>$userText<|end|><|assistant|>"
     }
 
+    /**
+     * Right-pad (or truncate) [ids] to exactly [length] tokens.
+     *
+     * Mirrors the `padding="max_length"` (max_length=[length]) config used when the
+     * .pte was exported, so the input tensor shape matches the static graph. Real tokens
+     * stay at the front; PAD_TOKEN_ID fills the tail; anything past [length] is dropped.
+     *
+     * Token ids are int64 (LongArray) to match the tokenizer/runner boundary.
+     */
+    private fun padOrTruncate(ids: LongArray, length: Int, padId: Long): LongArray {
+        if (ids.size == length) return ids
+        val out = LongArray(length) { padId }
+        val n = ids.size.coerceAtMost(length)
+        System.arraycopy(ids, 0, out, 0, n)
+        return out
+    }
+
     private fun greedyDecode(logits: FloatArray, inputLen: Int, maxNew: Int): LongArray {
         val vocabSize = 32000
         val result = LongArray(maxNew.coerceAtMost(logits.size / vocabSize))
@@ -189,6 +217,19 @@ class SlmInferenceEngine(
         private const val DEFAULT_MODEL_ASSET = "medi_phi_int4.pte"
         private const val TOKENIZER_ASSET = "tokenizer.model"
         const val CONFIDENCE_THRESHOLD = 0.25f
+
+        /** Fixed sequence length the .pte was exported with (`padding="max_length"`). */
+        private const val SEQ_LEN = 128
+
+        /**
+         * Pad token id used to right-pad inputs to [SEQ_LEN].
+         *
+         * VERIFY THIS against the tokenizer used at export time. For Phi-3 Mini the
+         * config's `pad_token_id` is typically 32000 (`<|endoftext|>`); many fine-tunes
+         * set pad = eos. Using the wrong id silently degrades output. Prefer
+         * `tokenizer.padId` if your Tokenizer exposes it.
+         */
+        private const val PAD_TOKEN_ID = 32000
     }
 }
 
